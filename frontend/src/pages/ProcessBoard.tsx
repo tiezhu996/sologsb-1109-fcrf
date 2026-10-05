@@ -8,6 +8,7 @@ import { useHerbStore } from '../stores/herbStore';
 import { useMethodStore } from '../stores/methodStore';
 import { useBatchStore } from '../stores/batchStore';
 import { useSampleStore } from '../stores/sampleStore';
+import { useFeedStore } from '../stores/feedStore';
 import { dueSamples, formatDate } from '../utils/degree';
 import type { ProcessBatch } from '../types/process-batch';
 import type { SampleExpiry } from '../types/retain-sample';
@@ -20,6 +21,8 @@ export default function ProcessBoard() {
   const methods = useMethodStore((s) => s.methods);
   const batches = useBatchStore((s) => s.batches);
   const samples = useSampleStore((s) => s.samples);
+  const linksOfBatch = useFeedStore((s) => s.linksOfBatch);
+  const allLinks = useFeedStore((s) => s.links);
 
   const pending = useMemo(() => batches.filter((b) => !b.locked), [batches]);
   const due = useMemo(() => dueSamples(samples, 30), [samples]);
@@ -38,12 +41,26 @@ export default function ProcessBoard() {
     return Number((batches.reduce((sum, b) => sum + b.yieldRate, 0) / batches.length).toFixed(1));
   }, [batches]);
 
-  const herbName = (id: string) => herbs.find((h) => h.id === id)?.name ?? '未知药材';
   const methodName = (id: string) => methods.find((m) => m.id === id)?.name ?? '未知方法';
+
+  /** 待炮制/待重试批次的逐笔在投来源（多来源拼批时全部列出） */
+  const renderSources = (batchId: string) => {
+    const active = linksOfBatch(batchId).filter((l) => l.status === 'active');
+    if (active.length === 0) return <Text type="warning">来源已全部撤回 · 待重试</Text>;
+    return (
+      <Space size={2} wrap>
+        {active.map((l) => (
+          <Tag key={l.id} color={l.sourceType === 'herb' ? 'green' : 'geekblue'}>
+            {l.sourceName} {l.feedKg}kg
+          </Tag>
+        ))}
+      </Space>
+    );
+  };
 
   const pendingColumns: TableColumnsType<ProcessBatch> = [
     { title: '生产批号', dataIndex: 'batchNo', width: 130, render: (v: string) => <Text strong>{v}</Text> },
-    { title: '药材', dataIndex: 'herbId', width: 100, render: (id: string) => herbName(id) },
+    { title: '投料来源', width: 200, render: (_, b) => renderSources(b.id) },
     { title: '炮制方法', dataIndex: 'methodId', width: 100, render: (id: string) => methodName(id) },
     { title: '投料量(kg)', dataIndex: 'feedKg', width: 100, align: 'right' },
     { title: '辅料用量(kg)', dataIndex: 'auxUsedKg', width: 110, align: 'right' },
@@ -156,13 +173,13 @@ export default function ProcessBoard() {
               columns={pendingColumns}
               dataSource={pending}
               pagination={{ pageSize: 6, hideOnSinglePage: true }}
-              scroll={{ x: 900 }}
+              scroll={{ x: 1050 }}
             />
           </Card>
         </Col>
         <Col xs={24} lg={9}>
           <Card title="最近炮制工序" size="small" style={{ marginBottom: 16 }}>
-            <ProcessTimeline batches={batches} herbs={herbs} methods={methods} limit={5} />
+            <ProcessTimeline batches={batches} herbs={herbs} methods={methods} links={allLinks} limit={5} />
           </Card>
           <Card title="留样到期提示" size="small">
             <Table

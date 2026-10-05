@@ -8,6 +8,7 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useSampleStore } from '../stores/sampleStore';
 import { useBatchStore } from '../stores/batchStore';
 import { useHerbStore } from '../stores/herbStore';
+import { useFeedStore } from '../stores/feedStore';
 import { CABINETS, type ObserveLog, type RetainSample, type SampleExpiry } from '../types/retain-sample';
 import { buildExpiryList, formatDate, todayStr } from '../utils/degree';
 
@@ -42,6 +43,7 @@ export default function SampleLedger() {
   const appendObserveLog = useSampleStore((s) => s.appendObserveLog);
   const batches = useBatchStore((s) => s.batches);
   const herbs = useHerbStore((s) => s.herbs);
+  const linksOfBatch = useFeedStore((s) => s.linksOfBatch);
 
   const [selectedCabinet, setSelectedCabinet] = useState<string | undefined>(undefined);
   const [open, setOpen] = useState(false);
@@ -64,6 +66,15 @@ export default function SampleLedger() {
     const herb = herbs.find((h) => h.id === batch.herbId);
     return `${batch.batchNo} · ${herb?.name ?? '未知药材'} · 得率 ${batch.yieldRate}%`;
   };
+
+  /** 留样批次的完整投料来源（逐笔可追溯） */
+  const sourceTagsOf = (batchId: string) =>
+    linksOfBatch(batchId).map((l) => (
+      <Tag key={l.id} color={l.status === 'withdrawn' ? 'default' : l.sourceType === 'herb' ? 'green' : 'geekblue'} style={{ marginBottom: 2 }}>
+        {l.status === 'withdrawn' ? '（已撤）' : ''}
+        {l.sourceName} · {l.sourceBatchNo}：{l.feedKg}kg
+      </Tag>
+    ));
 
   const openCreate = () => {
     const nextIndex = samples.length + 1;
@@ -124,7 +135,15 @@ export default function SampleLedger() {
 
   const columns: TableColumnsType<SampleExpiry> = [
     { title: '留样编号', width: 170, render: (_, row) => <Text strong>{row.sample.sampleNo}</Text> },
-    { title: '关联批次', width: 260, render: (_, row) => batchLabel(row.sample.batchId) },
+    { title: '关联批次', width: 230, render: (_, row) => batchLabel(row.sample.batchId) },
+    {
+      title: '投料来源（逐笔可追溯）',
+      width: 300,
+      render: (_, row) => {
+        const tags = sourceTagsOf(row.sample.batchId);
+        return tags.length ? <Space size={2} wrap>{tags}</Space> : <Text type="secondary">-</Text>;
+      },
+    },
     { title: '留样量(g)', width: 100, align: 'right', render: (_, row) => row.sample.amountG },
     { title: '留样期(月)', width: 100, align: 'right', render: (_, row) => row.sample.retainMonths },
     { title: '柜位', width: 80, render: (_, row) => <Tag color="green">{row.sample.cabinet}</Tag> },
@@ -151,7 +170,14 @@ export default function SampleLedger() {
           <Button size="small" type="link" onClick={() => openObserve(row.sample)}>
             追加观察
           </Button>
-          <Popconfirm title={`确认删除留样 ${row.sample.sampleNo}？`} onConfirm={() => removeSample(row.sample.id).then(() => message.success('已删除'))}>
+          <Popconfirm
+            title={`确认删除留样 ${row.sample.sampleNo}？`}
+            onConfirm={() =>
+              removeSample(row.sample.id)
+                .then(() => message.success('已删除'))
+                .catch((e: Error) => message.error(e.message))
+            }
+          >
             <Button size="small" type="link" danger>
               删除
             </Button>
@@ -212,7 +238,7 @@ export default function SampleLedger() {
       {visible.length === 0 ? (
         <EmptyPanel description={selectedCabinet ? `柜位 ${selectedCabinet} 暂无留样` : '暂无留样记录'} actionText="登记留样" onAction={openCreate} />
       ) : (
-        <Table rowKey={(row) => row.sample.id} size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1400 }} />
+        <Table rowKey={(row) => row.sample.id} size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1700 }} />
       )}
 
       <Modal open={open} title="登记留样" onCancel={() => setOpen(false)} onOk={submit} okText="保存" cancelText="取消" width={560}>

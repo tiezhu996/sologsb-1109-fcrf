@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { db } from '../utils/db';
 import { uid } from '../utils/id';
+import { useFeedStore } from './feedStore';
+import { AllocationError } from '../types/feed';
 import type { HerbGroupSummary, HerbMaterial, HerbOrigin, HerbPart } from '../types/herb-material';
 
 export interface HerbInput {
@@ -54,12 +56,24 @@ export const useHerbStore = create<HerbState>()((set, get) => ({
     if (!current) {
       return;
     }
+    // 已被工序在投占用的量不能被抹掉（投料关系必须可追溯）
+    if (patch.feedKg !== undefined) {
+      const nextKg = Number(patch.feedKg);
+      const used = useFeedStore.getState().usedKgOf('herb', id);
+      if (nextKg < used - 0.001) {
+        throw new AllocationError(`该药材批次已有 ${used}kg 投入炮制，入库量不能小于已分配量`);
+      }
+    }
     const next: HerbMaterial = { ...current, ...patch, feedKg: patch.feedKg !== undefined ? Number(patch.feedKg) : current.feedKg };
     await db.herbs.put(next);
     set({ herbs: get().herbs.map((h) => (h.id === id ? next : h)) });
   },
 
   removeHerb: async (id) => {
+    const usedLinks = useFeedStore.getState().activeLinksOfSource('herb', id);
+    if (usedLinks.length > 0) {
+      throw new AllocationError('该药材批次已被炮制工序引用（投料谱系需保留来源），不能删除');
+    }
     await db.herbs.delete(id);
     set({ herbs: get().herbs.filter((h) => h.id !== id) });
   },

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Alert, App as AntApp, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Typography } from 'antd';
+import { Alert, App as AntApp, Button, Card, DatePicker, Drawer, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import dayjs, { type Dayjs } from 'dayjs';
 import { useSearchParams } from 'react-router-dom';
@@ -7,22 +7,27 @@ import FilterBar from '../components/common/FilterBar';
 import FireLevelTag from '../components/common/FireLevelTag';
 import RatioCalculator from '../components/common/RatioCalculator';
 import EmptyPanel from '../components/common/EmptyPanel';
+import FeedSourcesEditor from '../components/common/FeedSourcesEditor';
+import FeedLineageList from '../components/common/FeedLineageList';
 import { useHerbFilter } from '../hooks/useHerbFilter';
 import { useHerbStore } from '../stores/herbStore';
 import { useMethodStore } from '../stores/methodStore';
-import { useBatchStore } from '../stores/batchStore';
+import { useBatchStore, BatchHasSampleError, BatchLockedError } from '../stores/batchStore';
+import { useFeedStore } from '../stores/feedStore';
+import { useSampleStore } from '../stores/sampleStore';
 import { HERB_ORIGINS, HERB_PARTS } from '../types/herb-material';
 import { FIRE_LEVELS, type FireLevel } from '../types/processing-method';
 import { PROCESS_DEGREES, type ProcessBatch, type ProcessDegree } from '../types/process-batch';
+import { AllocationError, type FeedLink, type FeedSourceInput } from '../types/feed';
 import { DEGREE_RULES, judgeDegree, suggestedValues } from '../utils/degree';
+import { downloadCsv } from '../utils/export';
 
 const { Title, Paragraph, Text } = Typography;
 
 interface BatchFormValues {
   batchNo: string;
-  herbId: string;
   methodId: string;
-  feedKg: number;
+  sources: FeedSourceInput[];
   auxUsedKg: number;
   outputKg: number;
   fireLevel: FireLevel;
@@ -37,7 +42,7 @@ interface BatchFormValues {
 
 const DEGREE_COLOR: Record<ProcessDegree, string> = { 不及: 'orange', 适中: 'green', 太过: 'red' };
 
-/** 工序记录台：选方法自动带出辅料比例、火候与判断标准，录入火候与得率 */
+/** 工序记录台：多来源拆批/拼批逐笔投料，选方法自动带出辅料比例、火候与判断标准 */
 export default function BatchBoard() {
   const { message } = AntApp.useApp();
   const herbs = useHerbStore((s) => s.herbs);
@@ -48,6 +53,11 @@ export default function BatchBoard() {
   const lockBatch = useBatchStore((s) => s.lockBatch);
   const unlockAsQc = useBatchStore((s) => s.unlockAsQc);
   const removeBatch = useBatchStore((s) => s.removeBatch);
+  const withdrawFeed = useBatchStore((s) => s.withdrawFeed);
+  const links = useFeedStore((s) => s.links);
+  const activeLinksOfBatch = useFeedStore((s) => s.activeLinksOfBatch);
+  const linksOfBatch = useFeedStore((s) => s.linksOfBatch);
+  const samples = useSampleStore((s) => s.samples);
 
   const herbFilter = useHerbFilter();
   const [params] = useSearchParams();
@@ -58,15 +68,19 @@ export default function BatchBoard() {
   const [editing, setEditing] = useState<ProcessBatch | null>(null);
   const [qcMode, setQcMode] = useState(false);
   const [showRules, setShowRules] = useState(false);
+  const [lineageTarget, setLineageTarget] = useState<ProcessBatch | null>(null);
 
   const watched = Form.useWatch([], form) as Partial<BatchFormValues> | undefined;
   const watchedMethod = methods.find((m) => m.id === (watched?.methodId ?? ''));
+  const watchedFeed = useMemo(
+    () => (watched?.sources ?? []).reduce((sum, s) => sum + (Number(s?.feedKg) || 0), 0),
+    [watched?.sources],
+  );
   const watchedYieldRate = useMemo(() => {
-    const feed = Number(watched?.feedKg) || 0;
     const out = Number(watched?.outputKg) || 0;
-    if (feed <= 0) return 0;
-    return Number(((out / feed) * 100).toFixed(1));
-  }, [watched?.feedKg, watched?.outputKg]);
+    if (watchedFeed <= 0) return 0;
+    return Number(((out / watchedFeed) * 100).toFixed(1));
+  }, [watched?.outputKg, watchedFeed]);
 
   const verdict = useMemo(() => {
     if (!watchedMethod) return undefined;
@@ -83,14 +97,18 @@ export default function BatchBoard() {
   const visibleBatches = useMemo(() => {
     const ids = new Set(visibleHerbs.map((h) => h.id));
     return batches.filter((b) => {
-      if (!ids.has(b.herbId)) return false;
+      const sourceHerbs = activeLinksOfBatch(b.id)
+        .filter((l) => l.sourceType === 'herb')
+        .map((l) => l.sourceId);
+      const hit = ids.has(b.herbId) || sourceHerbs.some((id) => ids.has(id));
+      if (!hit) return false;
       if (degreeParam && b.degree !== degreeParam) return false;
       return true;
     });
-  }, [batches, visibleHerbs, degreeParam]);
+  }, [batches, visibleHerbs, degreeParam, activeLinksOfBatch]);
 
-  const herbName = (id: string) => herbs.find((h) => h.id === id)?.name ?? '未知药材';
   const methodOf = (id: string) => methods.find((m) => m.id === id);
+  const sampleCountOf = (batchId: string) => samples.filter((s) => s.batchId === batchId).length;
 
   const openCreate = () => {
     setEditing(null);
@@ -98,14 +116,14 @@ export default function BatchBoard() {
     form.resetFields();
     const firstHerb = herbs[0];
     const firstMethod = methods[0];
+    const feed = firstHerb?.feedKg ?? 100;
     const now = dayjs();
     const base: Partial<BatchFormValues> = {
       batchNo: `PZ-${dayjs().format('YYMMDD')}-${String(batches.length + 1).padStart(2, '0')}`,
-      herbId: firstHerb?.id,
+      sources: firstHerb ? [{ sourceType: 'herb', sourceId: firstHerb.id, feedKg: feed }] : [],
       methodId: firstMethod?.id,
-      feedKg: firstHerb?.feedKg ?? 100,
-      outputKg: Number((((firstHerb?.feedKg ?? 100) * 0.94)).toFixed(1)),
-      auxUsedKg: Number((((firstHerb?.feedKg ?? 100) * (firstMethod?.auxRatio ?? 0)) / 100).toFixed(2)),
+      outputKg: Number((feed * 0.94).toFixed(1)),
+      auxUsedKg: Number(((feed * (firstMethod?.auxRatio ?? 0)) / 100).toFixed(2)),
       fireLevel: firstMethod?.fireLevel ?? '文火',
       temp: firstMethod ? Math.round((firstMethod.tempRange[0] + firstMethod.tempRange[1]) / 2) : 100,
       duration: firstMethod?.duration ?? 12,
@@ -123,11 +141,12 @@ export default function BatchBoard() {
     setQcMode(false);
     form.resetFields();
     const suggested = methodOf(record.methodId);
+    const activeLinks = activeLinksOfBatch(record.id);
+    const sources: FeedSourceInput[] = activeLinks.map((l) => ({ sourceType: l.sourceType, sourceId: l.sourceId, feedKg: l.feedKg }));
     form.setFieldsValue({
       batchNo: record.batchNo,
-      herbId: record.herbId,
+      sources,
       methodId: record.methodId,
-      feedKg: record.feedKg,
       auxUsedKg: record.auxUsedKg,
       outputKg: Number(((record.feedKg * record.yieldRate) / 100).toFixed(1)),
       fireLevel: record.fireLevel,
@@ -144,18 +163,17 @@ export default function BatchBoard() {
 
   const submit = async () => {
     const values = await form.validateFields();
-    const outputKg = Number(values.outputKg) || 0;
-    const feedKg = Number(values.feedKg) || 0;
+    const sources = (values.sources ?? []).map((s) => ({ sourceType: s.sourceType, sourceId: s.sourceId, feedKg: Number(s.feedKg) || 0 }));
+    const feedKg = sources.reduce((sum, s) => sum + s.feedKg, 0);
     if (feedKg <= 0) {
-      message.error('投料量必须大于 0');
+      message.error('投料合计必须大于 0');
       return;
     }
+    const outputKg = Number(values.outputKg) || 0;
     const yieldRate = Number(((outputKg / feedKg) * 100).toFixed(1));
-    const payload = {
+    const base = {
       batchNo: values.batchNo,
-      herbId: values.herbId,
       methodId: values.methodId,
-      feedKg,
       auxUsedKg: Number(values.auxUsedKg) || 0,
       fireLevel: values.fireLevel,
       startedAt: values.startedAt.toISOString(),
@@ -165,26 +183,97 @@ export default function BatchBoard() {
       operator: values.operator,
       remark: values.remark,
     };
-    if (editing) {
-      const ok = await updateBatch(editing.id, payload, qcMode);
-      if (!ok) {
-        message.error('该批已锁定，请打开「质检员改判」后再提交');
-        return;
+    try {
+      if (editing) {
+        // 已锁定工序的来源不可改：质检员改判仅提交火候/得率/程度字段
+        const payload = editing.locked ? base : { ...base, sources };
+        const ok = await updateBatch(editing.id, payload, qcMode);
+        if (!ok) {
+          message.error('该批已锁定，请打开「质检员改判」后再提交');
+          return;
+        }
+        if (qcMode && editing.locked) {
+          await unlockAsQc(editing.id, '质检员 · 赵敏');
+        }
+        message.success(`已更新 ${base.batchNo}，得率 ${yieldRate}%`);
+      } else {
+        await createBatch({ ...base, sources }, true);
+        message.success(`已提交 ${base.batchNo}，得率 ${yieldRate}%，已逐笔入账并锁定`);
       }
-      if (qcMode && editing.locked) {
-        await unlockAsQc(editing.id, '质检员 · 赵敏');
+      setOpen(false);
+    } catch (error) {
+      if (error instanceof AllocationError || error instanceof BatchLockedError || error instanceof BatchHasSampleError) {
+        message.error(error.message);
+      } else {
+        message.error(`提交失败：${(error as Error).message}`);
       }
-      message.success(`已更新 ${payload.batchNo}，得率 ${yieldRate}%`);
-    } else {
-      await createBatch(payload, true);
-      message.success(`已提交 ${payload.batchNo}，得率 ${yieldRate}%，该批已锁定`);
     }
-    setOpen(false);
+  };
+
+  const exportFeedCsv = () => {
+    const rows = links
+      .filter((l) => l.status === 'active')
+      .sort((a, b) => a.batchId.localeCompare(b.batchId) || a.seq - b.seq)
+      .map((l) => {
+        const batch = batches.find((b) => b.id === l.batchId);
+        return {
+          batchNo: batch?.batchNo ?? '',
+          sourceType: l.sourceType === 'herb' ? '药材批' : '工序成品',
+          sourceName: l.sourceName,
+          sourceBatchNo: l.sourceBatchNo,
+          seq: l.seq,
+          feedKg: l.feedKg,
+          remainKg: l.remainKg,
+          status: l.status === 'active' ? '在投' : '已撤回',
+          createdAt: l.createdAt.slice(0, 10),
+        };
+      });
+    downloadCsv(
+      `gbherbprocess-feed-ledger-${new Date().toISOString().slice(0, 10)}.csv`,
+      rows,
+      [
+        { key: 'batchNo', title: '生产批号' },
+        { key: 'sourceType', title: '来源类型' },
+        { key: 'sourceName', title: '来源名称' },
+        { key: 'sourceBatchNo', title: '来源批号' },
+        { key: 'seq', title: '笔次' },
+        { key: 'feedKg', title: '投入量kg' },
+        { key: 'remainKg', title: '入账后剩余kg' },
+        { key: 'status', title: '状态' },
+        { key: 'createdAt', title: '入账日期' },
+      ],
+    );
+    message.success(`已导出投料谱系台账 ${rows.length} 笔`);
+  };
+
+  const renderSourceTags = (record: ProcessBatch) => {
+    const batchLinks = linksOfBatch(record.id);
+    const active = batchLinks.filter((l) => l.status === 'active');
+    const withdrawnCount = batchLinks.length - active.length;
+    return (
+      <Space size={4} wrap>
+        <Tooltip title={active.map((l) => `${l.sourceName} · ${l.sourceBatchNo}：投 ${l.feedKg}kg，余 ${l.remainKg}kg`).join('\n')}>
+          <Space size={4} wrap>
+            {active.slice(0, 2).map((l) => (
+              <Tag key={l.id} color={l.sourceType === 'herb' ? 'green' : 'geekblue'}>
+                {l.sourceName} {l.feedKg}kg
+              </Tag>
+            ))}
+            {active.length > 2 ? <Tag>+{active.length - 2} 笔</Tag> : null}
+          </Space>
+        </Tooltip>
+        {withdrawnCount > 0 ? (
+          <Tooltip title={batchLinks.filter((l) => l.status === 'withdrawn').map((l) => `#${l.seq} ${l.sourceBatchNo}：${l.withdrawReason ?? '已撤回'}`).join('\n')}>
+            <Tag color="default">{withdrawnCount} 笔已撤回 · 待重试</Tag>
+          </Tooltip>
+        ) : null}
+      </Space>
+    );
   };
 
   const columns: TableColumnsType<ProcessBatch> = [
     { title: '生产批号', dataIndex: 'batchNo', width: 130, render: (v: string) => <Text strong>{v}</Text> },
-    { title: '药材', dataIndex: 'herbId', width: 90, render: (id: string) => herbName(id) },
+    { title: '投料来源', width: 230, render: (_, record) => renderSourceTags(record) },
     { title: '方法', dataIndex: 'methodId', width: 90, render: (id: string) => methodOf(id)?.name ?? '-' },
     {
       title: '火候',
@@ -192,29 +281,40 @@ export default function BatchBoard() {
       width: 180,
       render: (v: FireLevel, record) => <FireLevelTag level={v} tempRange={methodOf(record.methodId)?.tempRange} duration={methodOf(record.methodId)?.duration} />,
     },
-    { title: '投料(kg)', dataIndex: 'feedKg', width: 90, align: 'right' },
+    { title: '投料合计(kg)', dataIndex: 'feedKg', width: 110, align: 'right', render: (v: number) => v.toFixed(1) },
     { title: '辅料(kg)', dataIndex: 'auxUsedKg', width: 90, align: 'right' },
     { title: '得率(%)', dataIndex: 'yieldRate', width: 90, align: 'right', render: (v: number) => <Text type={v < 85 ? 'danger' : undefined}>{v}</Text> },
     { title: '程度', dataIndex: 'degree', width: 90, render: (v: ProcessDegree) => <Tag color={DEGREE_COLOR[v]}>{v}</Tag> },
     {
       title: '状态',
       dataIndex: 'locked',
-      width: 100,
+      width: 120,
       render: (locked: boolean, record) =>
-        locked ? <Tag color="blue">已锁定{record.qcBy ? ` · ${record.qcBy}` : ''}</Tag> : <Tag>待判定</Tag>,
+        locked ? <Tag color="blue">已锁定{record.qcBy ? ` · ${record.qcBy}` : ''}</Tag> : <Tag color="orange">待判定 / 待重试</Tag>,
     },
     { title: '操作人', dataIndex: 'operator', width: 90 },
     {
       title: '操作',
-      width: 230,
+      width: 280,
       fixed: 'right',
       render: (_, record) => (
-        <Space size={2}>
+        <Space size={2} wrap>
           <Button size="small" type="link" onClick={() => openEdit(record)}>
             {record.locked ? '质检改判' : '编辑'}
           </Button>
+          <Button size="small" type="link" onClick={() => setLineageTarget(record)}>
+            来源谱系
+          </Button>
           {!record.locked ? (
-            <Button size="small" type="link" onClick={() => lockBatch(record.id).then(() => message.success('已锁定该批'))}>
+            <Button
+              size="small"
+              type="link"
+              onClick={() =>
+                lockBatch(record.id)
+                  .then(() => message.success('已锁定该批'))
+                  .catch((e: Error) => message.error(e.message))
+              }
+            >
               锁定
             </Button>
           ) : (
@@ -222,8 +322,16 @@ export default function BatchBoard() {
               放行
             </Button>
           )}
-          <Popconfirm title={`确认删除 ${record.batchNo}？`} onConfirm={() => removeBatch(record.id).then(() => message.success('已删除'))}>
-            <Button size="small" type="link" danger>
+          <Popconfirm
+            title={`确认删除 ${record.batchNo}？`}
+            description="删除后各笔投料逐笔退回来源余量"
+            onConfirm={() =>
+              removeBatch(record.id)
+                .then(() => message.success('已删除，投料已逐笔退回'))
+                .catch((e: Error) => message.error(e.message))
+            }
+          >
+            <Button size="small" type="link" danger disabled={record.locked}>
               删除
             </Button>
           </Popconfirm>
@@ -238,7 +346,7 @@ export default function BatchBoard() {
         炮制工序记录台
       </Title>
       <Paragraph type="secondary">
-        选择方法即带出辅料比例、火候与判断标准；录入实际锅温、时长与炮制后重量，系统按标准自动给出程度判定，提交后锁定该批。
+        同规格药材可拆批分给两个班组，也可多批拼批、与上一道工序成品合并炮制；每笔逐行记录来源、投入量与剩余量，撤回只影响这一笔，未锁定工序保留原分配供重试。
       </Paragraph>
 
       <Space style={{ marginBottom: 12 }} wrap>
@@ -246,6 +354,7 @@ export default function BatchBoard() {
           新建工序记录
         </Button>
         <Button onClick={() => setShowRules((v) => !v)}>{showRules ? '收起程度判定规则' : '查看程度判定规则'}</Button>
+        <Button onClick={exportFeedCsv}>导出投料台账 CSV</Button>
       </Space>
 
       {showRules ? (
@@ -278,7 +387,7 @@ export default function BatchBoard() {
       {visibleBatches.length === 0 ? (
         <EmptyPanel description="没有符合条件的工序记录" actionText="新建一条工序记录" onAction={openCreate} />
       ) : (
-        <Table rowKey="id" size="small" columns={columns} dataSource={visibleBatches} pagination={{ pageSize: 10 }} scroll={{ x: 1400 }} />
+        <Table rowKey="id" size="small" columns={columns} dataSource={visibleBatches} pagination={{ pageSize: 10 }} scroll={{ x: 1500 }} />
       )}
 
       <Modal
@@ -286,39 +395,39 @@ export default function BatchBoard() {
         title={editing ? `工序记录 · ${editing.batchNo}` : '新建炮制工序记录'}
         onCancel={() => setOpen(false)}
         onOk={submit}
-        okText={editing ? '保存' : '提交并锁定该批'}
+        okText={editing ? '保存' : '提交并逐笔入账'}
         cancelText="取消"
-        width={760}
+        width={860}
       >
         <Form
           form={form}
           layout="vertical"
-          onValuesChange={(changed) => {
+          onValuesChange={(changed, all) => {
+            const sources = (all.sources ?? []) as FeedSourceInput[];
+            const totalFeed = sources.reduce((sum, s) => sum + (Number(s?.feedKg) || 0), 0);
             if ('methodId' in changed) {
               const method = methods.find((m) => m.id === changed.methodId);
               if (method) {
                 const suggestion = suggestedValues(method);
-                const feed = Number(form.getFieldValue('feedKg')) || 0;
                 form.setFieldsValue({
                   fireLevel: method.fireLevel,
                   temp: suggestion.temp,
                   duration: suggestion.duration,
-                  auxUsedKg: Number(((feed * method.auxRatio) / 100).toFixed(2)),
-                } as unknown as BatchFormValues);
+                  auxUsedKg: Number(((totalFeed * method.auxRatio) / 100).toFixed(2)),
+                } as unknown as Partial<BatchFormValues>);
               }
             }
-            if ('feedKg' in changed) {
+            if ('sources' in changed) {
               const method = methods.find((m) => m.id === form.getFieldValue('methodId'));
               if (method) {
-                const feed = Number(changed.feedKg) || 0;
                 form.setFieldsValue({
-                  auxUsedKg: Number(((feed * method.auxRatio) / 100).toFixed(2)),
-                  outputKg: Number((feed * (method.name === '蜜炙' ? 1.08 : 0.94)).toFixed(1)),
-                } as unknown as BatchFormValues);
+                  auxUsedKg: Number(((totalFeed * method.auxRatio) / 100).toFixed(2)),
+                  outputKg: Number((totalFeed * (method.name === '蜜炙' ? 1.08 : 0.94)).toFixed(1)),
+                } as unknown as Partial<BatchFormValues>);
               }
             }
             if (verdict && ('temp' in changed || 'duration' in changed || 'outputKg' in changed)) {
-              form.setFieldsValue({ degree: verdict.degree } as unknown as BatchFormValues);
+              form.setFieldsValue({ degree: verdict.degree } as unknown as Partial<BatchFormValues>);
             }
           }}
         >
@@ -327,7 +436,7 @@ export default function BatchBoard() {
               type="info"
               showIcon
               style={{ marginBottom: 12 }}
-              message="该批得率与程度已锁定，仅质检员可改"
+              message="该批得率与程度已锁定，仅质检员可改；投料来源与逐笔分配不可变更"
               action={<Switch checkedChildren="质检员改判" unCheckedChildren="只读" checked={qcMode} onChange={setQcMode} />}
             />
           ) : null}
@@ -336,22 +445,22 @@ export default function BatchBoard() {
             <Input maxLength={24} disabled={Boolean(editing?.locked) && !qcMode} />
           </Form.Item>
 
-          <Space size={12} style={{ display: 'flex' }} align="start">
-            <Form.Item name="herbId" label="药材" rules={[{ required: true, message: '请选择药材' }]} style={{ flex: 1 }}>
-              <Select
-                showSearch
-                optionFilterProp="label"
-                disabled={Boolean(editing?.locked) && !qcMode}
-                options={herbs.map((h) => ({ label: `${h.name} · ${h.batchNo}（${h.feedKg}kg）`, value: h.id }))}
-              />
-            </Form.Item>
-            <Form.Item name="methodId" label="炮制方法" rules={[{ required: true, message: '请选择炮制方法' }]} style={{ flex: 1 }}>
-              <Select
-                disabled={Boolean(editing?.locked) && !qcMode}
-                options={methods.map((m) => ({ label: `${m.name} · ${m.auxiliary} ${m.auxRatio}kg/100kg`, value: m.id }))}
-              />
-            </Form.Item>
-          </Space>
+          <Form.Item label="投料来源（逐笔，支持拆批 / 拼批 / 与另一批合并）" required style={{ marginBottom: 12 }}>
+            <FeedSourcesEditor
+              herbs={herbs}
+              batches={batches}
+              links={links}
+              excludeBatchId={editing?.id}
+              disabled={Boolean(editing?.locked)}
+            />
+          </Form.Item>
+
+          <Form.Item name="methodId" label="炮制方法" rules={[{ required: true, message: '请选择炮制方法' }]}>
+            <Select
+              disabled={Boolean(editing?.locked) && !qcMode}
+              options={methods.map((m) => ({ label: `${m.name} · ${m.auxiliary} ${m.auxRatio}kg/100kg`, value: m.id }))}
+            />
+          </Form.Item>
 
           {watchedMethod ? (
             <Alert
@@ -372,15 +481,13 @@ export default function BatchBoard() {
           <RatioCalculator
             auxRatio={watchedMethod?.auxRatio ?? 0}
             auxiliary={watchedMethod?.auxiliary ?? '无'}
-            feedKg={Number(watched?.feedKg) || 0}
+            feedKg={watchedFeed}
             auxUsedKg={Number(watched?.auxUsedKg) || 0}
             outputKg={Number(watched?.outputKg) || 0}
+            feedReadonly
             onChange={(patch) => {
-              if (patch.feedKg !== undefined) {
-                form.setFieldsValue({ feedKg: patch.feedKg } as unknown as BatchFormValues);
-              }
               if (patch.auxUsedKg !== undefined) {
-                form.setFieldsValue({ auxUsedKg: patch.auxUsedKg } as unknown as BatchFormValues);
+                form.setFieldsValue({ auxUsedKg: patch.auxUsedKg } as unknown as Partial<BatchFormValues>);
               }
             }}
           />
@@ -400,15 +507,11 @@ export default function BatchBoard() {
             </Form.Item>
           </Space>
 
-          <Form.Item name="feedKg" label="投料量(kg)" rules={[{ required: true, message: '请输入投料量' }]} style={{ maxWidth: 200 }}>
-            <InputNumber min={0} step={1} style={{ width: '100%' }} disabled={Boolean(editing?.locked) && !qcMode} />
-          </Form.Item>
-
           <Alert
             type={verdict?.degree === '适中' ? 'success' : verdict?.degree === '太过' ? 'error' : 'warning'}
             showIcon
             style={{ marginBottom: 12 }}
-            message={`系统判定：${verdict?.degree ?? '待录入火候与得率'}（得率 ${watchedYieldRate}%，预期 ${verdict?.expectedYield ?? '-'}%）`}
+            message={`系统判定：${verdict?.degree ?? '待录入火候与得率'}（得率 ${watchedYieldRate}%，预期 ${verdict?.expectedYield ?? '-'}%，投料合计 ${watchedFeed.toFixed(1)}kg）`}
             description={
               <ul style={{ margin: 0, paddingLeft: 18 }}>
                 {(verdict?.reasons ?? ['选择方法并录入锅温、时长、炮制后重量后自动判定']).map((r) => (
@@ -439,6 +542,39 @@ export default function BatchBoard() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <Drawer
+        open={Boolean(lineageTarget)}
+        title={`投料来源谱系 · ${lineageTarget?.batchNo ?? ''}`}
+        width={860}
+        onClose={() => setLineageTarget(null)}
+        extra={
+          lineageTarget ? (
+            lineageTarget.locked ? (
+              <Tag color="blue">工序已锁定，来源与留样不可撤</Tag>
+            ) : sampleCountOf(lineageTarget.id) > 0 ? (
+              <Tag color="orange">已有留样，不可撤回投料</Tag>
+            ) : (
+              <Tag color="orange">未锁定：可逐笔撤回，撤回后保留本单供重试</Tag>
+            )
+          ) : null
+        }
+      >
+        {lineageTarget ? (
+          <FeedLineageList
+            links={linksOfBatch(lineageTarget.id)}
+            withdrawDisabled={lineageTarget.locked || sampleCountOf(lineageTarget.id) > 0}
+            onWithdraw={async (link: FeedLink) => {
+              try {
+                await withdrawFeed(link.id);
+                message.success(`已撤回第 #${link.seq} 笔，来源余量已恢复，其它笔次不受影响`);
+              } catch (error) {
+                message.error((error as Error).message);
+              }
+            }}
+          />
+        ) : null}
+      </Drawer>
     </div>
   );
 }

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --port 21809"
+    "preview": "vite preview --port 21809",
+    "test": "tsx scripts/sanity-check.mjs && tsx scripts/upgrade-check.mjs && tsx scripts/e2e-check.mjs && tsx scripts/mount-smoke.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^5.5.2",
@@ -19,10 +20,14 @@
     "zustand": "^4.5.5"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^29.1.1",
+    "tsx": "^4.23.15",
     "typescript": "~5.7.3",
     "vite": "^6.1.0"
   }

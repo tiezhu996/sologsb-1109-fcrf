@@ -20,6 +20,8 @@ export interface RatioCalculatorProps {
   reverse?: boolean;
   /** 紧凑模式（表格行内使用） */
   compact?: boolean;
+  /** 投料量只读（总量由逐笔来源合计决定时使用） */
+  feedReadonly?: boolean;
 }
 
 /**
@@ -34,6 +36,7 @@ export default function RatioCalculator({
   onChange,
   reverse = true,
   compact = false,
+  feedReadonly = false,
 }: RatioCalculatorProps) {
   const ratio = useRatio({ auxRatio, feedKg, auxUsedKg, outputKg });
   const needAux = needAuxiliary(auxiliary);
@@ -62,8 +65,11 @@ export default function RatioCalculator({
           value={feedKg}
           addonAfter="kg"
           style={{ width: 140 }}
+          readOnly={feedReadonly}
+          disabled={feedReadonly}
           onChange={(value) => onChange?.({ feedKg: Number(value) || 0 })}
         />
+        {feedReadonly ? <Text type="secondary" style={{ fontSize: 12 }}>由逐笔来源合计</Text> : null}
         <span style={{ color: '#6b7a70' }}>应投辅料</span>
         <Text strong>{needAux ? `${ratio.auxTargetKg} kg` : '无需辅料'}</Text>
       </Space>
@@ -93,7 +99,7 @@ export default function RatioCalculator({
         />
       ) : null}
 
-      {reverse && needAux ? (
+      {reverse && needAux && !feedReadonly ? (
         <Space wrap size={8} align="center">
           <span style={{ color: '#6b7a70' }}>反向推算：现有辅料</span>
           <InputNumber

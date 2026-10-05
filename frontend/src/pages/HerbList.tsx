@@ -6,6 +6,7 @@ import FilterBar from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
 import { useHerbFilter } from '../hooks/useHerbFilter';
 import { useHerbStore } from '../stores/herbStore';
+import { useFeedStore } from '../stores/feedStore';
 import { HERB_ORIGINS, HERB_PARTS, type HerbMaterial } from '../types/herb-material';
 import { formatDate } from '../utils/degree';
 
@@ -28,6 +29,7 @@ export default function HerbList() {
   const addHerb = useHerbStore((s) => s.addHerb);
   const updateHerb = useHerbStore((s) => s.updateHerb);
   const removeHerb = useHerbStore((s) => s.removeHerb);
+  const usedKgOf = useFeedStore((s) => s.usedKgOf);
   const filter = useHerbFilter();
   const [form] = Form.useForm<HerbFormValues>();
   const [open, setOpen] = useState(false);
@@ -40,11 +42,11 @@ export default function HerbList() {
     visible.forEach((herb) => {
       const row = map.get(herb.name) ?? { name: herb.name, origin: herb.origin, part: herb.part, batches: 0, kg: 0 };
       row.batches += 1;
-      row.kg += herb.feedKg;
+      row.kg += Math.max(0, herb.feedKg - usedKgOf('herb', herb.id));
       map.set(herb.name, row);
     });
     return Array.from(map.values()).sort((a, b) => b.kg - a.kg);
-  }, [visible]);
+  }, [visible, usedKgOf]);
 
   const openCreate = () => {
     setEditing(null);
@@ -71,13 +73,18 @@ export default function HerbList() {
       remark: values.remark,
     };
     if (editing) {
-      await updateHerb(editing.id, payload);
-      message.success(`已更新药材 ${payload.name}`);
+      try {
+        await updateHerb(editing.id, payload);
+        message.success(`已更新药材 ${payload.name}`);
+        setOpen(false);
+      } catch (error) {
+        message.error((error as Error).message);
+      }
     } else {
       await addHerb(payload);
       message.success(`已登记药材 ${payload.name}`);
+      setOpen(false);
     }
-    setOpen(false);
   };
 
   const columns: TableColumnsType<HerbMaterial> = [
@@ -85,7 +92,22 @@ export default function HerbList() {
     { title: '基原', dataIndex: 'origin', width: 80, render: (v: string) => <Tag color="green">{v}</Tag> },
     { title: '药用部位', dataIndex: 'part', width: 90 },
     { title: '批次号', dataIndex: 'batchNo', width: 120 },
-    { title: '投料量(kg)', dataIndex: 'feedKg', width: 110, align: 'right' },
+    { title: '入库量(kg)', dataIndex: 'feedKg', width: 100, align: 'right' },
+    {
+      title: '已投入(kg)',
+      width: 100,
+      align: 'right',
+      render: (_, record) => usedKgOf('herb', record.id).toFixed(1),
+    },
+    {
+      title: '剩余(kg)',
+      width: 100,
+      align: 'right',
+      render: (_, record) => {
+        const remain = record.feedKg - usedKgOf('herb', record.id);
+        return <Text type={remain <= 0 ? 'secondary' : 'success'}>{remain.toFixed(1)}</Text>;
+      },
+    },
     { title: '入库时间', dataIndex: 'receivedAt', width: 120, render: (v: string) => formatDate(v) },
     { title: '备注', dataIndex: 'remark', ellipsis: true, render: (v?: string) => v ?? '-' },
     {
@@ -97,7 +119,14 @@ export default function HerbList() {
           <Button size="small" type="link" onClick={() => openEdit(record)}>
             编辑
           </Button>
-          <Popconfirm title={`确认删除 ${record.name}（${record.batchNo}）？`} onConfirm={() => removeHerb(record.id).then(() => message.success('已删除'))}>
+          <Popconfirm
+            title={`确认删除 ${record.name}（${record.batchNo}）？`}
+            onConfirm={() =>
+              removeHerb(record.id)
+                .then(() => message.success('已删除'))
+                .catch((e: Error) => message.error(e.message))
+            }
+          >
             <Button size="small" type="link" danger>
               删除
             </Button>
@@ -159,7 +188,7 @@ export default function HerbList() {
               ]}
             />
           </Card>
-          <Table rowKey="id" size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1000 }} />
+          <Table rowKey="id" size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1200 }} />
         </>
       )}
 
