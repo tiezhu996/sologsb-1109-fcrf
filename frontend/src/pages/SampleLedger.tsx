@@ -5,11 +5,13 @@ import dayjs, { type Dayjs } from 'dayjs';
 import StatBadge from '../components/common/StatBadge';
 import CabinetGrid from '../components/common/CabinetGrid';
 import EmptyPanel from '../components/common/EmptyPanel';
+import LineageTree from '../components/common/LineageTree';
 import { useSampleStore } from '../stores/sampleStore';
 import { useBatchStore } from '../stores/batchStore';
 import { useHerbStore } from '../stores/herbStore';
 import { CABINETS, type ObserveLog, type RetainSample, type SampleExpiry } from '../types/retain-sample';
 import { buildExpiryList, formatDate, todayStr } from '../utils/degree';
+import { lineageOf } from '../utils/lineage';
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -41,6 +43,7 @@ export default function SampleLedger() {
   const removeSample = useSampleStore((s) => s.removeSample);
   const appendObserveLog = useSampleStore((s) => s.appendObserveLog);
   const batches = useBatchStore((s) => s.batches);
+  const feeds = useBatchStore((s) => s.feeds);
   const herbs = useHerbStore((s) => s.herbs);
 
   const [selectedCabinet, setSelectedCabinet] = useState<string | undefined>(undefined);
@@ -48,6 +51,7 @@ export default function SampleLedger() {
   const [form] = Form.useForm<SampleFormValues>();
   const [observeTarget, setObserveTarget] = useState<RetainSample | null>(null);
   const [observeForm] = Form.useForm<ObserveFormValues>();
+  const [lineageSample, setLineageSample] = useState<RetainSample | null>(null);
 
   const expiryList = useMemo(() => buildExpiryList(samples, 30), [samples]);
   const dueList = useMemo(() => expiryList.filter((item) => item.daysLeft <= 30), [expiryList]);
@@ -63,6 +67,15 @@ export default function SampleLedger() {
     if (!batch) return '未知批次';
     const herb = herbs.find((h) => h.id === batch.herbId);
     return `${batch.batchNo} · ${herb?.name ?? '未知药材'} · 得率 ${batch.yieldRate}%`;
+  };
+
+  const handleRemove = async (sample: RetainSample) => {
+    try {
+      await removeSample(sample.id);
+      message.success('已删除');
+    } catch (error) {
+      message.error((error as Error).message);
+    }
   };
 
   const openCreate = () => {
@@ -124,7 +137,20 @@ export default function SampleLedger() {
 
   const columns: TableColumnsType<SampleExpiry> = [
     { title: '留样编号', width: 170, render: (_, row) => <Text strong>{row.sample.sampleNo}</Text> },
-    { title: '关联批次', width: 260, render: (_, row) => batchLabel(row.sample.batchId) },
+    { title: '关联批次', width: 230, render: (_, row) => batchLabel(row.sample.batchId) },
+    {
+      title: '投入来源',
+      width: 110,
+      align: 'center',
+      render: (_, row) => {
+        const count = feeds.filter((f) => f.active && f.batchId === row.sample.batchId).length;
+        return (
+          <Button size="small" type="link" onClick={() => setLineageSample(row.sample)}>
+            {count > 0 ? `${count} 笔来源` : '单节点来源'}
+          </Button>
+        );
+      },
+    },
     { title: '留样量(g)', width: 100, align: 'right', render: (_, row) => row.sample.amountG },
     { title: '留样期(月)', width: 100, align: 'right', render: (_, row) => row.sample.retainMonths },
     { title: '柜位', width: 80, render: (_, row) => <Tag color="green">{row.sample.cabinet}</Tag> },
@@ -151,8 +177,12 @@ export default function SampleLedger() {
           <Button size="small" type="link" onClick={() => openObserve(row.sample)}>
             追加观察
           </Button>
-          <Popconfirm title={`确认删除留样 ${row.sample.sampleNo}？`} onConfirm={() => removeSample(row.sample.id).then(() => message.success('已删除'))}>
-            <Button size="small" type="link" danger>
+          <Popconfirm
+            title={`确认删除留样 ${row.sample.sampleNo}？`}
+            description={batches.find((b) => b.id === row.sample.batchId)?.locked ? '关联工序已锁定，留样不能删除' : undefined}
+            onConfirm={() => handleRemove(row.sample)}
+          >
+            <Button size="small" type="link" danger disabled={Boolean(batches.find((b) => b.id === row.sample.batchId)?.locked)}>
               删除
             </Button>
           </Popconfirm>
@@ -212,7 +242,7 @@ export default function SampleLedger() {
       {visible.length === 0 ? (
         <EmptyPanel description={selectedCabinet ? `柜位 ${selectedCabinet} 暂无留样` : '暂无留样记录'} actionText="登记留样" onAction={openCreate} />
       ) : (
-        <Table rowKey={(row) => row.sample.id} size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1400 }} />
+        <Table rowKey={(row) => row.sample.id} size="small" columns={columns} dataSource={visible} pagination={{ pageSize: 8 }} scroll={{ x: 1500 }} />
       )}
 
       <Modal open={open} title="登记留样" onCancel={() => setOpen(false)} onOk={submit} okText="保存" cancelText="取消" width={560}>
@@ -286,6 +316,25 @@ export default function SampleLedger() {
             <Button onClick={() => setObserveTarget(null)}>关闭</Button>
           </Space>
         </Form>
+      </Modal>
+
+      <Modal
+        open={Boolean(lineageSample)}
+        title={`留样投入来源谱系 · ${lineageSample?.sampleNo ?? ''}`}
+        onCancel={() => setLineageSample(null)}
+        footer={<Button onClick={() => setLineageSample(null)}>关闭</Button>}
+        width={680}
+      >
+        {(() => {
+          const batch = lineageSample ? batches.find((b) => b.id === lineageSample.batchId) : undefined;
+          if (!batch) return <Text type="secondary">关联批次已不存在</Text>;
+          return (
+            <Space direction="vertical" size={12} style={{ display: 'flex' }}>
+              <Text type="secondary">关联工序 {batch.batchNo}（{batch.locked ? '已锁定' : '未锁定'}），留样与导出均按此谱系追溯投入。</Text>
+              <LineageTree nodes={lineageOf({ herbs, batches, feeds }, batch)} />
+            </Space>
+          );
+        })()}
       </Modal>
     </div>
   );

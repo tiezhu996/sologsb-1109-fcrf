@@ -49,9 +49,9 @@ npm run build    # 类型检查 + 生产构建
 │   ├── nginx.conf             # try_files SPA 回退 + gzip
 │   ├── public/favicon.svg
 │   └── src/
-│       ├── types/             # herb-material / processing-method / process-batch / retain-sample
+│       ├── types/             # herb-material / processing-method / process-batch / retain-sample / feed-entry
 │       ├── stores/            # herbStore / methodStore / batchStore / sampleStore
-│       ├── components/common/ # RatioCalculator / FireLevelTag / CabinetGrid / FilterBar / StatBadge / ProcessTimeline / EmptyPanel
+│       ├── components/common/ # RatioCalculator / FireLevelTag / CabinetGrid / FilterBar / StatBadge / ProcessTimeline / EmptyPanel / LineageTree / SourceFeedsEditor
 │       ├── hooks/             # useHerbFilter / useRatio
 │       ├── pages/             # ProcessBoard / HerbList / MethodList / BatchBoard / SampleLedger
 │       ├── router/index.tsx   # 路由表
@@ -70,7 +70,14 @@ npm run build    # 类型检查 + 生产构建
 
 ## 数据存储说明
 
-- 全部数据存于浏览器 IndexedDB（Dexie，库名 `gbherbprocess-db`），表：`herbs`、`methods`、`batches`、`samples`、`meta`。
-- `db.version(1)` 建表声明索引；`db.version(2).upgrade(...)` 为 `batches` 增加 `locked` 索引并回填历史数据。升级前可用顶栏「导出备份」导出全量 JSON。
-- 首次打开且表为空时写入一批示例台账（`src/utils/seed.ts`），便于直接查看各页面效果。
+- 全部数据存于浏览器 IndexedDB（Dexie，库名 `gbherbprocess-db`），表：`herbs`、`methods`、`batches`、`samples`、`feeds`、`meta`。
+- `db.version(1)` 建表声明索引；`db.version(2).upgrade(...)` 为 `batches` 增加 `locked` 索引并回填历史数据；`db.version(3).upgrade(...)` 新增 `feeds` 逐笔投料关系表，旧工序只有 `herbId + feedKg` 单来源，升级时按该记录补一笔来源（投入量=feedKg），形成单节点谱系，留样与备份恢复后都能查回投入。
+- **投料追溯**：一个工序可挂多笔来源（同规格药材拆批分投两个班组、多批拼批合并炮制），每笔记录来源（药材批次或上游工序产出）、投入量、分配时剩余量快照；实时剩余量由全部有效记录滚动计算。来源可来自上游工序产出，谱系递归展开到最初药材批次。
+- **事务与撤回**：新建/重新分配在单个 Dexie 事务内完成余额读取与逐笔写入，任一笔超出剩余量即整体回滚，恢复原分配；撤回只把该笔置为 `active=false`，只影响这一笔、其他笔与工序保留，未完成工序可重新分配后重试。已锁定工序及其留样不可删除、来源不可撤回；已登记留样的工序也不可删除。
+- 顶栏可「导出备份 / 恢复备份」，备份含 `feeds`；恢复后逐笔记录与完整谱系立即可见。升级前建议先导出全量 JSON。
+- 首次打开且表为空时写入一批示例台账（`src/utils/seed.ts`），其中包含一批投两班组（白术 80/40、黄芪 120/120）、拼批（蜜炙黄芪 120 + 甘草 50）与以上游工序产出再投料的示例，便于直接查看谱系效果。
 - 容器无状态：不使用数据库服务、不挂载命名卷，`docker compose down` 后数据仍留在浏览器中。
+
+## 脚本
+
+- `scripts/verify-feeds.ts`：基于 fake-indexeddb 的端到端校验（拆批/拼批、超额回滚、单笔撤回、锁定与留样保护、多层谱系、v2→v3 升级、备份往返）。运行：`npx esbuild scripts/verify-feeds.ts --bundle --platform=node --format=esm --outfile=/tmp/verify.mjs && node /tmp/verify.mjs`（依赖 `fake-indexeddb`，仅校验时临时安装）。

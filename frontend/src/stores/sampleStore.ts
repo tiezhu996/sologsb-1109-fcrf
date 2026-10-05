@@ -74,6 +74,14 @@ export const useSampleStore = create<SampleState>()((set, get) => ({
   },
 
   removeSample: async (id) => {
+    const current = get().samples.find((s) => s.id === id);
+    if (current) {
+      // 已锁定工序批次及其留样不能被撤掉
+      const batch = await db.batches.get(current.batchId);
+      if (batch?.locked) {
+        throw new Error(`留样关联的 ${batch.batchNo} 已锁定，留样不能删除（需质检员放行后处理）`);
+      }
+    }
     await db.samples.delete(id);
     set({ samples: get().samples.filter((s) => s.id !== id) });
   },
